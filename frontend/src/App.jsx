@@ -5,6 +5,7 @@ import './App.css'
 
 function App() {
   const [transcript, setTranscript] = useState('')
+  const [segments, setSegments] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [fileName, setFileName] = useState('')
@@ -17,6 +18,7 @@ function App() {
     setLoading(true)
     setError('')
     setTranscript('')
+    setSegments([])
     const formData = new FormData()
     formData.append('file', file)
     try {
@@ -24,6 +26,7 @@ function App() {
         headers: { 'Content-Type': 'multipart/form-data' }
       })
       setTranscript(response.data.text)
+      setSegments(response.data.segments)
     } catch (err) {
       setError('Transcription failed. Make sure the backend is running.')
     } finally {
@@ -43,12 +46,21 @@ function App() {
     setTimeout(() => setCopied(false), 2000)
   }
 
-  const downloadTxt = () => {
-    const blob = new Blob([transcript], { type: 'text/plain' })
+  const formatTime = (seconds) => {
+    const h = Math.floor(seconds / 3600).toString().padStart(2, '0')
+    const m = Math.floor((seconds % 3600) / 60).toString().padStart(2, '0')
+    const s = Math.floor(seconds % 60).toString().padStart(2, '0')
+    return `${h}:${m}:${s}`
+  }
+
+  const downloadMd = () => {
+    const lines = segments.map(seg => `**[${formatTime(seg.start)}]** ${seg.text.trim()}`)
+    const content = lines.join('\n\n')
+    const blob = new Blob([content], { type: 'text/markdown' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `${fileName}-transcript.txt`
+    a.download = `${fileName}-transcript.md`
     a.click()
   }
 
@@ -112,8 +124,8 @@ function App() {
                 <button className="btn btn-ghost" onClick={handleCopy}>
                   {copied ? '✓ Copied' : 'Copy'}
                 </button>
-                <button className="btn btn-primary" onClick={downloadTxt}>
-                  Download .txt
+                <button className="btn btn-primary" onClick={downloadMd}>
+                  Download .md
                 </button>
               </div>
             </div>
