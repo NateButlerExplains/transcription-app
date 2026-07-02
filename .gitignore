@@ -208,3 +208,6 @@ __marimo__/
 
 # AutoClaw KDream data
 .autoclaw/
+
+# macOS metadata
+.DS_Store
