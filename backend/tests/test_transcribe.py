@@ -3,7 +3,11 @@
 Whisper and Langfuse are stubbed in conftest.py, so these run without the real
 model, ffmpeg, or network.
 """
+import asyncio
+import glob
 import io
+import os
+import tempfile
 
 import pytest
 
@@ -23,9 +27,10 @@ def test_happy_path(client, stub_model):
     assert len(stub_model.calls) == 1
 
 
-def test_oversize_rejected_413(client, app_module, stub_model):
-    limit = app_module.MAX_UPLOAD_BYTES
-    resp = client.post("/transcribe", files=_upload(b"\x00" * (limit + 1)))
+def test_oversize_rejected_413(client, app_module, stub_model, monkeypatch):
+    # Patch a tiny cap instead of building a 200 MB payload.
+    monkeypatch.setattr(app_module, "MAX_UPLOAD_BYTES", 1024)
+    resp = client.post("/transcribe", files=_upload(b"\x00" * 2048))
     assert resp.status_code == 413
     assert not stub_model.calls  # never reached the model
 
@@ -62,3 +67,39 @@ def test_extension_allowlist_permits_octet_stream_with_good_ext(client, stub_mod
                       content_type="application/octet-stream"),
     )
     assert resp.status_code == 200
+
+
+def test_octet_stream_with_bad_ext_rejected_415(client, stub_model):
+    # Generic content type + non-media extension must NOT bypass validation.
+    resp = client.post(
+        "/transcribe",
+        files=_upload(b"\x00" * 2048, filename="notes.txt",
+                      content_type="application/octet-stream"),
+    )
+    assert resp.status_code == 415
+    assert not stub_model.calls
+
+
+def test_no_tempfile_leak_on_cancellation(app_module):
+    """CancelledError (BaseException, not Exception) mid-read must still remove
+    the partial temp file."""
+
+    class _CancellingUpload:
+        filename = "clip.wav"
+        content_type = "audio/wav"
+
+        def __init__(self):
+            self._calls = 0
+
+        async def read(self, size=-1):
+            self._calls += 1
+            if self._calls == 1:
+                return b"\x00" * 4096  # first chunk written to temp file
+            raise asyncio.CancelledError()  # cancelled mid-stream
+
+    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "*")))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(app_module._stream_to_tempfile(_CancellingUpload(), ".wav"))
+    after = set(glob.glob(os.path.join(tempfile.gettempdir(), "*")))
+    # No new temp file left behind.
+    assert after == before

@@ -33,8 +33,10 @@ ALLOWED_CONTENT_TYPES = {
     "audio/x-flac", "audio/opus", "audio/3gpp",
     "video/mp4", "video/mpeg", "video/webm", "video/quicktime",
     "video/x-matroska", "video/x-msvideo",
-    "application/octet-stream",  # browsers often send this for media blobs
 }
+# Generic content types carry no media signal — accept only if the extension is
+# in the allowlist. Browsers often send octet-stream for media blobs.
+GENERIC_CONTENT_TYPES = {"", "application/octet-stream"}
 ALLOWED_EXTENSIONS = {
     ".mp3", ".mp4", ".m4a", ".aac", ".wav", ".webm", ".ogg", ".oga",
     ".flac", ".opus", ".mpeg", ".mpga", ".mkv", ".mov", ".avi", ".3gp",
@@ -77,7 +79,11 @@ def _validate_upload(file: UploadFile):
     """Reject unsupported media before reading the body. Raises HTTPException(415)."""
     ext = os.path.splitext(file.filename or "")[1].lower()
     content_type = (file.content_type or "").split(";")[0].strip().lower()
-    if content_type in ALLOWED_CONTENT_TYPES or ext in ALLOWED_EXTENSIONS:
+    # A concrete audio/video content type passes on its own. A generic or missing
+    # content type carries no media signal, so require an allowed extension.
+    if content_type in ALLOWED_CONTENT_TYPES:
+        return
+    if content_type in GENERIC_CONTENT_TYPES and ext in ALLOWED_EXTENSIONS:
         return
     raise HTTPException(
         status_code=415,
@@ -111,7 +117,9 @@ async def _stream_to_tempfile(file: UploadFile, suffix: str):
                         ),
                     )
                 tmp.write(chunk)
-    except Exception:
+    except BaseException:
+        # BaseException (not just Exception) so asyncio.CancelledError during an
+        # awaited read still triggers cleanup of the partial temp file.
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
         raise
