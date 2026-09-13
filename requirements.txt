@@ -10,6 +10,7 @@ fsspec==2026.2.0
 h11==0.16.0
 idna==3.11
 Jinja2==3.1.6
+langfuse==3.7.0
 llvmlite==0.46.0
 MarkupSafe==3.0.3
 more-itertools==10.8.0
@@ -20,6 +21,7 @@ numpy==2.4.3
 openai-whisper==20250625
 pydantic==2.12.5
 pydantic_core==2.41.5
+python-dotenv==1.2.1
 python-multipart==0.0.22
 regex==2026.2.28
 requests==2.32.5
