@@ -314,3 +314,113 @@ body {
   color: var(--text-muted);
   letter-spacing: 0.05em;
 }
+/* LIVE RECORDING */
+.live-panel {
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--bg-2);
+  padding: 20px 24px;
+  margin-bottom: 20px;
+}
+
+.live-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.live-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: 'Syne', sans-serif;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--text);
+}
+
+.live-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+.live-dot[data-on='true'] { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+
+.switch {
+  width: 46px;
+  height: 26px;
+  border-radius: 999px;
+  border: 1px solid var(--border-hover);
+  background: var(--bg-3);
+  padding: 2px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.switch.on { background: var(--accent-dim); border-color: var(--accent); }
+.switch-knob {
+  display: block;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition: transform 0.2s, background 0.2s;
+}
+.switch.on .switch-knob { transform: translateX(20px); background: var(--accent); }
+
+.live-body { margin-top: 18px; }
+
+.source-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.source-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.source-toggle input { accent-color: var(--accent); cursor: pointer; }
+
+.live-controls {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.btn-stop {
+  background: var(--red);
+  color: #fff;
+  font-weight: 500;
+}
+.btn-stop:hover { background: #ff6666; }
+
+.rec-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+  letter-spacing: 0.08em;
+  color: var(--red);
+}
+.rec-blink {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--red);
+  animation: recpulse 1s infinite;
+}
+@keyframes recpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+.live-error { margin-top: 16px; }
+
+.live-hint {
+  margin-top: 14px;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+}

@@ -1,6 +1,7 @@
 import { useState, useCallback } from 'react'
 import { useDropzone } from 'react-dropzone'
 import axios from 'axios'
+import { useLiveRecorder } from './useLiveRecorder'
 import './App.css'
 
 function App() {
@@ -11,28 +12,68 @@ function App() {
   const [fileName, setFileName] = useState('')
   const [copied, setCopied] = useState(false)
 
-  const onDrop = useCallback(async (acceptedFiles) => {
-    const file = acceptedFiles[0]
+  // Live-recording feature state
+  const [liveEnabled, setLiveEnabled] = useState(false)
+  const [useMic, setUseMic] = useState(true)
+  const [useComputer, setUseComputer] = useState(false)
+
+  // Shared transcription: send any File/Blob to the backend and render results.
+  const transcribeFile = useCallback(async (file, displayName) => {
     if (!file) return
-    setFileName(file.name)
+    setFileName(displayName)
     setLoading(true)
     setError('')
     setTranscript('')
     setSegments([])
     const formData = new FormData()
-    formData.append('file', file)
+    formData.append('file', file, displayName)
     try {
       const response = await axios.post('http://127.0.0.1:8000/transcribe', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       })
       setTranscript(response.data.text)
       setSegments(response.data.segments)
-    } catch (err) {
+    } catch {
       setError('Transcription failed. Make sure the backend is running.')
     } finally {
       setLoading(false)
     }
   }, [])
+
+  const handleRecordedBlob = useCallback(
+    (blob, mimeType) => {
+      const ext = mimeType && mimeType.includes('webm') ? 'webm' : 'audio'
+      const name = `recording.${ext}`
+      const file = new File([blob], name, { type: mimeType || blob.type })
+      transcribeFile(file, name)
+    },
+    [transcribeFile]
+  )
+
+  const { recording, elapsed, recError, setRecError, start, stop } = useLiveRecorder({
+    onBlob: handleRecordedBlob
+  })
+
+  const onDrop = useCallback(
+    async (acceptedFiles) => {
+      const file = acceptedFiles[0]
+      if (!file) return
+      transcribeFile(file, file.name)
+    },
+    [transcribeFile]
+  )
+
+  const formatElapsed = (secs) => {
+    const m = Math.floor(secs / 60).toString().padStart(2, '0')
+    const s = Math.floor(secs % 60).toString().padStart(2, '0')
+    return `${m}:${s}`
+  }
+
+  const toggleLive = () => {
+    if (liveEnabled && recording) stop()
+    setRecError('')
+    setLiveEnabled((v) => !v)
+  }
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
@@ -85,6 +126,76 @@ function App() {
             Powered by OpenAI Whisper — runs entirely on your machine.
             No uploads to the cloud. No data leaving your device.
           </p>
+        </div>
+
+        <div className="live-panel">
+          <div className="live-head">
+            <div className="live-title">
+              <span className="live-dot" data-on={liveEnabled} />
+              Live recording
+            </div>
+            <button
+              type="button"
+              className={`switch ${liveEnabled ? 'on' : ''}`}
+              onClick={toggleLive}
+              aria-pressed={liveEnabled}
+              aria-label="Toggle live recording feature"
+            >
+              <span className="switch-knob" />
+            </button>
+          </div>
+
+          {liveEnabled && (
+            <div className="live-body">
+              <div className="source-toggles">
+                <label className="source-toggle">
+                  <input
+                    type="checkbox"
+                    checked={useMic}
+                    disabled={recording}
+                    onChange={(e) => setUseMic(e.target.checked)}
+                  />
+                  <span>🎙 Microphone</span>
+                </label>
+                <label className="source-toggle">
+                  <input
+                    type="checkbox"
+                    checked={useComputer}
+                    disabled={recording}
+                    onChange={(e) => setUseComputer(e.target.checked)}
+                  />
+                  <span>💻 Computer audio</span>
+                </label>
+              </div>
+
+              <div className="live-controls">
+                {!recording ? (
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    disabled={loading || (!useMic && !useComputer)}
+                    onClick={() => start({ useMic, useComputer })}
+                  >
+                    ● Record
+                  </button>
+                ) : (
+                  <button type="button" className="btn btn-stop" onClick={stop}>
+                    ■ Stop
+                  </button>
+                )}
+                {recording && (
+                  <span className="rec-indicator">
+                    <span className="rec-blink" /> REC {formatElapsed(elapsed)}
+                  </span>
+                )}
+              </div>
+
+              {recError && <div className="error-banner live-error">{recError}</div>}
+              <p className="live-hint">
+                For computer audio, tick “Share tab audio” / “Share system audio” in the browser picker.
+              </p>
+            </div>
+          )}
         </div>
 
         <div {...getRootProps()} className={`dropzone ${isDragActive ? 'active' : ''} ${loading ? 'loading' : ''}`}>
