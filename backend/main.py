@@ -36,35 +36,41 @@ model = whisper.load_model("base")
 _model_lock = threading.Lock()
 
 
-def _blocking_transcribe(path):
-    """Runs in a worker thread. The lock serializes access to the one model."""
-    with _model_lock:
-        return model.transcribe(path)
-
-
-async def transcribe_bytes(data: bytes, suffix: str = ".webm"):
-    """Write audio bytes to a temp file and transcribe them off the event loop.
-
-    Returns (text, segments). On any decode/transcription error returns
-    ("", []) so partial/streaming callers can keep going.
+def _transcribe_bytes_blocking(data: bytes, suffix: str):
+    """Runs entirely in a worker thread: writes the temp file, transcribes, and
+    removes the temp file — so NONE of the disk I/O or CPU work touches the event
+    loop. The lock serializes access to the single shared model. Temp-file
+    cleanup ownership is established the moment the path exists (finally), so a
+    write failure or exception can't leak a temp file.
     """
-    if not data:
-        return "", []
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(data)
             tmp_path = tmp.name
-        result = await run_in_threadpool(_blocking_transcribe, tmp_path)
-        return result["text"], result["segments"]
-    except Exception:
-        return "", []
+        with _model_lock:
+            return model.transcribe(tmp_path)
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+
+async def transcribe_bytes(data: bytes, suffix: str = ".webm"):
+    """Transcribe audio bytes fully off the event loop.
+
+    Returns (text, segments). On any decode/transcription error returns
+    ("", []) so partial/streaming callers can keep going.
+    """
+    if not data:
+        return "", []
+    try:
+        result = await run_in_threadpool(_transcribe_bytes_blocking, data, suffix)
+        return result["text"], result["segments"]
+    except Exception:
+        return "", []
 
 
 @app.get("/")
@@ -74,21 +80,12 @@ def read_root():
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile = File(...)):
-    # Save uploaded file to a temp location
     suffix = os.path.splitext(file.filename or "")[1] or ".webm"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        contents = await file.read()
-        tmp.write(contents)
-        tmp_path = tmp.name
-
-    try:
-        # Run Whisper OFF the event loop, serialized through the model lock, so
-        # the one-shot upload never blocks streaming clients (and vice-versa).
-        result = await run_in_threadpool(_blocking_transcribe, tmp_path)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
+    contents = await file.read()
+    # The temp-file write + transcription + cleanup all run in the worker thread,
+    # serialized through the model lock, so the one-shot upload never blocks the
+    # event loop (or streaming clients), and no temp file is leaked.
+    result = await run_in_threadpool(_transcribe_bytes_blocking, contents, suffix)
     return {
         "text": result["text"],
         "segments": result["segments"],

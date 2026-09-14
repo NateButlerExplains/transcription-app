@@ -102,12 +102,21 @@ function App() {
 
   const handleStreamNote = useCallback((msg) => setStreamNote(msg), [])
 
+  // Session was cancelled/unmounted: invalidate any in-flight one-shot fallback
+  // POST so its late response can't write the UI or trigger an auto-save.
+  const handleAbort = useCallback(() => {
+    requestIdRef.current++
+    setLiveText('')
+    setLoading(false)
+  }, [])
+
   const { recording, starting, stopping, finalizing, elapsed, recError, setRecError, start, stop, cancel } =
     useLiveRecorder({
       onBlob: handleRecordedBlob,
       onPartial: handlePartial,
       onFinal: handleFinal,
       onStreamNote: handleStreamNote,
+      onAbort: handleAbort,
       wsUrl: 'ws://127.0.0.1:8000/ws/transcribe'
     })
 
@@ -137,10 +146,15 @@ function App() {
   }
 
   const toggleLive = () => {
-    // Disabling mid-startup/recording/finalizing must abandon the session.
-    if (liveEnabled && busy) cancel()
+    if (liveEnabled) {
+      // Disabling mid-session abandons it; either way invalidate any pending
+      // fallback POST/auto-save that was kicked off after a stop.
+      if (busy) cancel()
+      requestIdRef.current++
+    }
     setRecError('')
     setLiveText('')
+    setStreamNote('')
     setLiveEnabled((v) => !v)
   }
 

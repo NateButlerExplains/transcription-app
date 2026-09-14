@@ -31,17 +31,20 @@ import { useCallback, useEffect, useRef, useState } from 'react'
  *  - cancel()/unmount stops all tracks, closes the AudioContext, and closes the
  *    WebSocket without delivering a blob.
  */
-export function useLiveRecorder({ onBlob, onPartial, onFinal, onStreamNote, wsUrl } = {}) {
+const FALLBACK_UNAVAILABLE =
+  'Live transcription unavailable — the full transcript will appear after you stop.'
+
+export function useLiveRecorder({ onBlob, onPartial, onFinal, onStreamNote, onAbort, wsUrl } = {}) {
   // 'idle' | 'starting' | 'recording' | 'stopping' | 'finalizing'
   const [status, setStatus] = useState('idle')
   const [elapsed, setElapsed] = useState(0)
   const [recError, setRecError] = useState('')
 
   // Latest callbacks kept in a ref so handler identities never churn deps.
-  const cbRef = useRef({ onBlob, onPartial, onFinal, onStreamNote })
+  const cbRef = useRef({ onBlob, onPartial, onFinal, onStreamNote, onAbort })
   useEffect(() => {
-    cbRef.current = { onBlob, onPartial, onFinal, onStreamNote }
-  }, [onBlob, onPartial, onFinal, onStreamNote])
+    cbRef.current = { onBlob, onPartial, onFinal, onStreamNote, onAbort }
+  }, [onBlob, onPartial, onFinal, onStreamNote, onAbort])
 
   // Committed session refs (written only once a session is fully started).
   const audioCtxRef = useRef(null)
@@ -66,6 +69,14 @@ export function useLiveRecorder({ onBlob, onPartial, onFinal, onStreamNote, wsUr
   const finalizedRef = useRef(false) // final delivered (or fallback done)
   const finalizingRef = useRef(false) // stop sent, awaiting final
   const pendingBlobRef = useRef(null) // { blob, type } for fallback delivery
+  const streamNotedRef = useRef(false) // a fallback note already shown this session
+
+  // Show exactly one fallback note per session (never zero, never conflicting).
+  const noteFallback = useCallback((msg) => {
+    if (streamNotedRef.current) return
+    streamNotedRef.current = true
+    cbRef.current.onStreamNote?.(msg)
+  }, [])
 
   const clearTimer = () => {
     if (timerRef.current) {
@@ -149,9 +160,9 @@ export function useLiveRecorder({ onBlob, onPartial, onFinal, onStreamNote, wsUr
     closeWs()
     busyRef.current = false
     setStatus('idle')
-    cbRef.current.onStreamNote?.('Live stream ended early — transcribing the full recording.')
+    noteFallback('Live stream ended early — transcribing the full recording.')
     if (pb && pb.blob.size > 0) cbRef.current.onBlob?.(pb.blob, pb.type)
-  }, [closeWs])
+  }, [closeWs, noteFallback])
 
   const handleWsMessage = useCallback(
     (ev) => {
@@ -167,6 +178,7 @@ export function useLiveRecorder({ onBlob, onPartial, onFinal, onStreamNote, wsUr
       } else if (msg.type === 'final') {
         finalizedRef.current = true
         finalizingRef.current = false
+        pendingBlobRef.current = null // release the buffered fallback blob
         closeWs()
         busyRef.current = false
         setStatus('idle')
@@ -183,11 +195,14 @@ export function useLiveRecorder({ onBlob, onPartial, onFinal, onStreamNote, wsUr
     finalizedRef.current = true // ignore any late ws final
     finalizingRef.current = false
     pendingBlobRef.current = null
+    chunksRef.current = [] // release retained audio buffers
     closeWs()
     releaseResources(false)
     busyRef.current = false
     setStatus('idle')
     setElapsed(0)
+    // Let App invalidate any in-flight one-shot fallback POST + auto-save.
+    cbRef.current.onAbort?.()
   }, [closeWs, releaseResources])
 
   // Release everything if the component unmounts mid-startup/recording.
@@ -195,9 +210,12 @@ export function useLiveRecorder({ onBlob, onPartial, onFinal, onStreamNote, wsUr
     return () => {
       startTokenRef.current += 1
       finalizedRef.current = true
+      pendingBlobRef.current = null
+      chunksRef.current = []
       closeWs()
       releaseResources(false)
       busyRef.current = false
+      cbRef.current.onAbort?.()
     }
   }, [closeWs, releaseResources])
 
@@ -298,6 +316,7 @@ export function useLiveRecorder({ onBlob, onPartial, onFinal, onStreamNote, wsUr
         finalizedRef.current = false
         finalizingRef.current = false
         streamOkRef.current = false
+        streamNotedRef.current = false
         sendQueueRef.current = []
         pendingBlobRef.current = null
         chunksRef.current = []
@@ -313,19 +332,19 @@ export function useLiveRecorder({ onBlob, onPartial, onFinal, onStreamNote, wsUr
             }
             ws.onmessage = handleWsMessage
             ws.onerror = () => {
-              if (!streamOkRef.current) {
-                cbRef.current.onStreamNote?.(
-                  'Live transcription unavailable — the full transcript will appear after you stop.'
-                )
-              }
+              // Note only when it never worked; a mid/late failure is announced
+              // by the eventual fallback (onstop else / finalizeFallback).
+              if (!streamOkRef.current) noteFallback(FALLBACK_UNAVAILABLE)
               streamOkRef.current = false
             }
             ws.onclose = () => {
+              streamOkRef.current = false
               // If we've asked for the final and never got it, fall back.
               if (finalizingRef.current) finalizeFallback()
             }
           } catch {
             wsRef.current = null
+            noteFallback(FALLBACK_UNAVAILABLE)
           }
         }
 
@@ -359,10 +378,13 @@ export function useLiveRecorder({ onBlob, onPartial, onFinal, onStreamNote, wsUr
               finalizeFallback()
             }
           } else {
-            // No healthy stream — one-shot fallback.
+            // No healthy stream (never opened, still connecting, or closed) —
+            // one-shot fallback. Ensure the user is told live text was skipped.
+            finalizedRef.current = true
             busyRef.current = false
             setStatus('idle')
             closeWs()
+            noteFallback(FALLBACK_UNAVAILABLE)
             if (blob.size > 0) cbRef.current.onBlob?.(blob, type)
           }
         }
@@ -414,7 +436,7 @@ export function useLiveRecorder({ onBlob, onPartial, onFinal, onStreamNote, wsUr
         }
       }
     },
-    [releaseResources, closeWs, flushQueue, handleWsMessage, finalizeFallback, wsUrl]
+    [releaseResources, closeWs, flushQueue, handleWsMessage, finalizeFallback, noteFallback, wsUrl]
   )
 
   const stop = useCallback(() => {
