@@ -14,25 +14,36 @@ import { useCallback, useEffect, useRef, useState } from 'react'
  * Mixing: AudioContext + one MediaStreamAudioSourceNode per source, all wired
  * into a single MediaStreamAudioDestinationNode whose stream is recorded.
  *
- * Lifecycle: startup runs through a 'starting' status that blocks re-entry, and
- * is cancellable via a monotonically increasing start token — if the feature is
- * disabled or the component unmounts before startup commits, the in-flight
- * streams are stopped and nothing is written to the committed refs.
+ * Lifecycle guarantees:
+ *  - Startup runs through a 'starting' status behind a sync busy guard, so a
+ *    second session can never begin while one is starting/active/stopping.
+ *  - Every acquired resource (input stream, AudioContext, destination) is
+ *    registered for cancellation the moment it exists — a cancel()/unmount mid
+ *    startup stops it immediately (no stuck mic light / screen-share banner).
+ *  - A monotonic start token owns the guard/status/committed refs: only the
+ *    CURRENT token may release the busy guard or mutate shared state, so a
+ *    stale startup completion stops only the streams it locally acquired and
+ *    touches nothing shared.
+ *  - stop() is idempotent: a committed recorder is allowed to finish delivering
+ *    its blob; a second Stop is a no-op, never a discard.
  */
 export function useLiveRecorder({ onBlob } = {}) {
-  // 'idle' | 'starting' | 'recording'
+  // 'idle' | 'starting' | 'recording' | 'stopping'
   const [status, setStatus] = useState('idle')
   const [elapsed, setElapsed] = useState(0)
   const [recError, setRecError] = useState('')
 
-  // Committed session refs (only written once a session is fully started).
+  // Committed session refs (written only once a session is fully started).
   const audioCtxRef = useRef(null)
   const destRef = useRef(null)
   const recorderRef = useRef(null)
   const chunksRef = useRef([])
-  const streamsRef = useRef([]) // raw input MediaStreams to stop (mic + display)
+  const streamsRef = useRef([]) // raw input MediaStreams (mic + display)
   const timerRef = useRef(null)
   const mimeRef = useRef('')
+
+  // In-flight (starting, not yet committed) resources — owned for cancellation.
+  const inflightRef = useRef(null) // { streams:[], ctx, dest }
 
   // Re-entry guard (sync) + cancellation token for in-flight startup.
   const busyRef = useRef(false)
@@ -45,9 +56,18 @@ export function useLiveRecorder({ onBlob } = {}) {
     }
   }
 
-  // Tear down a COMMITTED session: recorder + destination output + input streams
-  // + AudioContext. `deliver=false` detaches handlers so no blob is emitted
-  // (used for cancel/unmount); the normal stop() path delivers via onstop.
+  // Stop a bundle of resources: destination output tracks, input tracks, ctx.
+  // Stopping the destination stream's OWN tracks is required — closing the
+  // AudioContext is not a substitute.
+  const stopBundle = (streams, ctx, dest) => {
+    if (dest?.stream) dest.stream.getTracks().forEach((t) => t.stop())
+    streams.forEach((stream) => stream.getTracks().forEach((t) => t.stop()))
+    if (ctx && ctx.state !== 'closed') ctx.close().catch(() => {})
+  }
+
+  // Tear down BOTH the committed session and any in-flight startup resources.
+  // `deliver=false` detaches recorder handlers so no blob is emitted
+  // (cancel/unmount); the normal stop() path passes true so onstop delivers.
   const releaseResources = useCallback((deliver) => {
     clearTimer()
     const recorder = recorderRef.current
@@ -65,19 +85,17 @@ export function useLiveRecorder({ onBlob } = {}) {
         }
       }
     }
-    // Stop the destination's OWN output track (closing the ctx is not enough).
-    if (destRef.current?.stream) {
-      destRef.current.stream.getTracks().forEach((t) => t.stop())
-    }
-    // Stop every input track (releases mic + screen-share indicator).
-    streamsRef.current.forEach((stream) => stream.getTracks().forEach((t) => t.stop()))
+    stopBundle(streamsRef.current, audioCtxRef.current, destRef.current)
     streamsRef.current = []
-    if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
-      audioCtxRef.current.close().catch(() => {})
-    }
     audioCtxRef.current = null
     destRef.current = null
     recorderRef.current = null
+
+    const inf = inflightRef.current
+    if (inf) {
+      stopBundle(inf.streams, inf.ctx, inf.dest)
+      inflightRef.current = null
+    }
   }, [])
 
   // Abandon the current session/startup without emitting a blob.
@@ -108,7 +126,8 @@ export function useLiveRecorder({ onBlob } = {}) {
 
   const start = useCallback(
     async ({ useMic, useComputer }) => {
-      // Block re-entry: never begin a second session while one is starting/active.
+      // Block re-entry: never begin a second session while one is
+      // starting / active / stopping.
       if (busyRef.current) return
       setRecError('')
 
@@ -123,22 +142,24 @@ export function useLiveRecorder({ onBlob } = {}) {
 
       busyRef.current = true
       const myToken = ++startTokenRef.current
-      const isStale = () => startTokenRef.current !== myToken
+      const isCurrent = () => startTokenRef.current === myToken
       setStatus('starting')
 
-      // Streams held locally until the session is fully committed to refs.
-      const captured = [] // every raw stream we opened (for cleanup on failure)
-      const sourceStreams = [] // audio-only streams that feed the mixer
+      // Own in-flight resources from the moment they exist so cancel()/unmount
+      // can release them even mid-await.
+      const inflight = { streams: [], ctx: null, dest: null }
+      inflightRef.current = inflight
+      const sourceStreams = [] // audio-only streams feeding the mixer
 
+      // Stop only what THIS startup locally acquired; touch shared state only
+      // when still the current token.
       const abort = (userError) => {
-        captured.forEach((s) => s.getTracks().forEach((t) => t.stop()))
-        if (!isStale()) {
+        stopBundle(inflight.streams, inflight.ctx, inflight.dest)
+        if (inflightRef.current === inflight) inflightRef.current = null
+        if (isCurrent()) {
           if (userError) setRecError(userError)
           busyRef.current = false
           setStatus('idle')
-        } else {
-          // Cancelled mid-startup: streams stopped above, stay idle silently.
-          busyRef.current = false
         }
       }
 
@@ -150,8 +171,8 @@ export function useLiveRecorder({ onBlob } = {}) {
             return abort('Computer audio capture is not supported in this browser (try Chrome or Edge).')
           }
           const displayStream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true })
-          captured.push(displayStream)
-          if (isStale()) return abort()
+          inflight.streams.push(displayStream)
+          if (!isCurrent()) return abort()
 
           const audioTracks = displayStream.getAudioTracks()
           if (audioTracks.length === 0) {
@@ -166,8 +187,8 @@ export function useLiveRecorder({ onBlob } = {}) {
 
         if (useMic) {
           const micStream = await navigator.mediaDevices.getUserMedia({ audio: true })
-          captured.push(micStream)
-          if (isStale()) return abort()
+          inflight.streams.push(micStream)
+          if (!isCurrent()) return abort()
           sourceStreams.push(micStream)
         }
       } catch (err) {
@@ -175,21 +196,18 @@ export function useLiveRecorder({ onBlob } = {}) {
       }
 
       // Mix all sources into a single destination stream, then record it.
-      let ctx
       try {
         const AudioCtx = window.AudioContext || window.webkitAudioContext
-        ctx = new AudioCtx()
+        const ctx = new AudioCtx()
+        inflight.ctx = ctx // owned for cancellation before we await resume()
         const dest = ctx.createMediaStreamDestination()
+        inflight.dest = dest
         sourceStreams.forEach((stream) => ctx.createMediaStreamSource(stream).connect(dest))
 
         // B4: a context created suspended after the prompts records silence.
         if (ctx.state === 'suspended') await ctx.resume()
-        if (isStale()) {
-          if (ctx.state !== 'closed') ctx.close().catch(() => {})
-          return abort()
-        }
+        if (!isCurrent()) return abort()
         if (ctx.state !== 'running') {
-          if (ctx.state !== 'closed') ctx.close().catch(() => {})
           return abort('Could not start the audio engine (context not running).')
         }
 
@@ -204,6 +222,7 @@ export function useLiveRecorder({ onBlob } = {}) {
           if (e.data && e.data.size > 0) chunksRef.current.push(e.data)
         }
         recorder.onstop = () => {
+          if (!isCurrent()) return
           const type = mimeRef.current || (chunksRef.current[0]?.type ?? 'audio/webm')
           const blob = new Blob(chunksRef.current, { type })
           chunksRef.current = []
@@ -214,6 +233,7 @@ export function useLiveRecorder({ onBlob } = {}) {
           if (blob.size > 0) onBlob?.(blob, type)
         }
         recorder.onerror = () => {
+          if (!isCurrent()) return
           releaseResources(false)
           busyRef.current = false
           setStatus('idle')
@@ -221,37 +241,38 @@ export function useLiveRecorder({ onBlob } = {}) {
           setRecError('Recording failed unexpectedly. Please try again.')
         }
 
-        // Suggestion: if a source track ends (user stops screen share mid-record),
-        // stop the session instead of timing over silence.
+        // If a source track ends (user stops screen share mid-record), stop the
+        // session instead of timing over silence.
         sourceStreams.forEach((stream) =>
           stream.getTracks().forEach((track) => {
             track.onended = () => {
-              if (recorderRef.current === recorder && recorder.state !== 'inactive') {
+              if (recorderRef.current === recorder && recorder.state === 'recording') {
+                setStatus('stopping')
                 recorder.stop()
               }
             }
           })
         )
 
-        // Commit the session to the shared refs.
+        // Commit the session: ownership moves from inflight to the committed refs.
         audioCtxRef.current = ctx
         destRef.current = dest
         recorderRef.current = recorder
-        streamsRef.current = captured
+        streamsRef.current = inflight.streams
+        inflightRef.current = null
 
         recorder.start()
         setStatus('recording')
         setElapsed(0)
         timerRef.current = setInterval(() => setElapsed((s) => s + 1), 1000)
       } catch (err) {
-        captured.forEach((s) => s.getTracks().forEach((t) => t.stop()))
-        if (ctx && ctx.state !== 'closed') ctx.close().catch(() => {})
-        if (!isStale()) {
+        // Nothing committed yet — tear down the in-flight bundle only.
+        stopBundle(inflight.streams, inflight.ctx, inflight.dest)
+        if (inflightRef.current === inflight) inflightRef.current = null
+        if (isCurrent()) {
           setRecError('Could not start recording: ' + (err?.message || 'unknown error'))
           busyRef.current = false
           setStatus('idle')
-        } else {
-          busyRef.current = false
         }
       }
     },
@@ -260,18 +281,24 @@ export function useLiveRecorder({ onBlob } = {}) {
 
   const stop = useCallback(() => {
     const recorder = recorderRef.current
-    if (recorder && recorder.state !== 'inactive') {
-      recorder.stop() // fires onstop -> builds blob + releaseResources
-    } else {
-      // Nothing committed yet (still starting): abandon it.
-      cancel()
+    if (recorder) {
+      // Committed session. Let it finish delivering; a second Stop is a no-op.
+      if (recorder.state === 'recording' || recorder.state === 'paused') {
+        setStatus('stopping')
+        recorder.stop() // onstop builds the blob + releaseResources
+      }
+      return
     }
+    // No committed recorder: only a 'starting' session (nothing to deliver) or
+    // nothing at all. Abandon a starting session.
+    if (busyRef.current) cancel()
   }, [cancel])
 
   return {
     status,
     recording: status === 'recording',
     starting: status === 'starting',
+    stopping: status === 'stopping',
     elapsed,
     recError,
     setRecError,

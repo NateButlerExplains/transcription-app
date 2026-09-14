@@ -56,7 +56,7 @@ function App() {
     [transcribeFile]
   )
 
-  const { recording, starting, elapsed, recError, setRecError, start, stop, cancel } =
+  const { recording, starting, stopping, elapsed, recError, setRecError, start, stop, cancel } =
     useLiveRecorder({ onBlob: handleRecordedBlob })
 
   const onDrop = useCallback(
@@ -76,7 +76,7 @@ function App() {
 
   const toggleLive = () => {
     // Disabling mid-startup or mid-recording must abandon the in-flight session.
-    if (liveEnabled && (recording || starting)) cancel()
+    if (liveEnabled && (recording || starting || stopping)) cancel()
     setRecError('')
     setLiveEnabled((v) => !v)
   }
@@ -175,7 +175,16 @@ function App() {
               </div>
 
               <div className="live-controls">
-                {!recording ? (
+                {recording || stopping ? (
+                  <button
+                    type="button"
+                    className="btn btn-stop"
+                    disabled={stopping}
+                    onClick={stop}
+                  >
+                    {stopping ? 'Stopping…' : '■ Stop'}
+                  </button>
+                ) : (
                   <button
                     type="button"
                     className="btn btn-primary"
@@ -184,12 +193,8 @@ function App() {
                   >
                     {starting ? 'Starting…' : '● Record'}
                   </button>
-                ) : (
-                  <button type="button" className="btn btn-stop" onClick={stop}>
-                    ■ Stop
-                  </button>
                 )}
-                {recording && (
+                {(recording || stopping) && (
                   <span className="rec-indicator">
                     <span className="rec-blink" /> REC {formatElapsed(elapsed)}
                   </span>
@@ -269,7 +274,8 @@ function extForMime(mime) {
   if (!mime) return 'webm'
   if (mime.includes('webm')) return 'webm'
   if (mime.includes('ogg')) return 'ogg'
-  if (mime.includes('mp4') || mime.includes('mpeg')) return 'm4a'
+  if (mime.includes('mp4')) return 'm4a'
+  if (mime.includes('mpeg') || mime.includes('mp3')) return 'mp3'
   return 'webm'
 }
 
