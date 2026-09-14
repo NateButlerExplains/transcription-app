@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useRef } from 'react'
 import { useDropzone } from 'react-dropzone'
 import axios from 'axios'
 import { useLiveRecorder } from './useLiveRecorder'
@@ -17,9 +17,13 @@ function App() {
   const [useMic, setUseMic] = useState(true)
   const [useComputer, setUseComputer] = useState(false)
 
+  // B5: only the most-recent transcription request may write the display.
+  const requestIdRef = useRef(0)
+
   // Shared transcription: send any File/Blob to the backend and render results.
   const transcribeFile = useCallback(async (file, displayName) => {
     if (!file) return
+    const myId = ++requestIdRef.current
     setFileName(displayName)
     setLoading(true)
     setError('')
@@ -31,28 +35,29 @@ function App() {
       const response = await axios.post('http://127.0.0.1:8000/transcribe', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       })
+      if (requestIdRef.current !== myId) return // stale response, ignore
       setTranscript(response.data.text)
       setSegments(response.data.segments)
     } catch {
+      if (requestIdRef.current !== myId) return
       setError('Transcription failed. Make sure the backend is running.')
     } finally {
-      setLoading(false)
+      if (requestIdRef.current === myId) setLoading(false)
     }
   }, [])
 
   const handleRecordedBlob = useCallback(
     (blob, mimeType) => {
-      const ext = mimeType && mimeType.includes('webm') ? 'webm' : 'audio'
-      const name = `recording.${ext}`
-      const file = new File([blob], name, { type: mimeType || blob.type })
+      const type = mimeType || blob.type
+      const name = `recording.${extForMime(type)}`
+      const file = new File([blob], name, { type })
       transcribeFile(file, name)
     },
     [transcribeFile]
   )
 
-  const { recording, elapsed, recError, setRecError, start, stop } = useLiveRecorder({
-    onBlob: handleRecordedBlob
-  })
+  const { recording, starting, elapsed, recError, setRecError, start, stop, cancel } =
+    useLiveRecorder({ onBlob: handleRecordedBlob })
 
   const onDrop = useCallback(
     async (acceptedFiles) => {
@@ -70,7 +75,8 @@ function App() {
   }
 
   const toggleLive = () => {
-    if (liveEnabled && recording) stop()
+    // Disabling mid-startup or mid-recording must abandon the in-flight session.
+    if (liveEnabled && (recording || starting)) cancel()
     setRecError('')
     setLiveEnabled((v) => !v)
   }
@@ -173,10 +179,10 @@ function App() {
                   <button
                     type="button"
                     className="btn btn-primary"
-                    disabled={loading || (!useMic && !useComputer)}
+                    disabled={loading || starting || (!useMic && !useComputer)}
                     onClick={() => start({ useMic, useComputer })}
                   >
-                    ● Record
+                    {starting ? 'Starting…' : '● Record'}
                   </button>
                 ) : (
                   <button type="button" className="btn btn-stop" onClick={stop}>
@@ -255,6 +261,16 @@ function App() {
       </footer>
     </div>
   )
+}
+
+// Map the actual recorded MIME type to a container extension the backend/ffmpeg
+// accepts, so a filename never mislabels its bytes.
+function extForMime(mime) {
+  if (!mime) return 'webm'
+  if (mime.includes('webm')) return 'webm'
+  if (mime.includes('ogg')) return 'ogg'
+  if (mime.includes('mp4') || mime.includes('mpeg')) return 'm4a'
+  return 'webm'
 }
 
 export default App

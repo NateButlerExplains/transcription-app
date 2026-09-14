@@ -13,29 +13,64 @@ import { useCallback, useEffect, useRef, useState } from 'react'
  *
  * Mixing: AudioContext + one MediaStreamAudioSourceNode per source, all wired
  * into a single MediaStreamAudioDestinationNode whose stream is recorded.
+ *
+ * Lifecycle: startup runs through a 'starting' status that blocks re-entry, and
+ * is cancellable via a monotonically increasing start token — if the feature is
+ * disabled or the component unmounts before startup commits, the in-flight
+ * streams are stopped and nothing is written to the committed refs.
  */
 export function useLiveRecorder({ onBlob } = {}) {
-  const [recording, setRecording] = useState(false)
+  // 'idle' | 'starting' | 'recording'
+  const [status, setStatus] = useState('idle')
   const [elapsed, setElapsed] = useState(0)
   const [recError, setRecError] = useState('')
 
+  // Committed session refs (only written once a session is fully started).
   const audioCtxRef = useRef(null)
   const destRef = useRef(null)
   const recorderRef = useRef(null)
   const chunksRef = useRef([])
-  const streamsRef = useRef([]) // all raw MediaStreams to stop (mic + display)
+  const streamsRef = useRef([]) // raw input MediaStreams to stop (mic + display)
   const timerRef = useRef(null)
   const mimeRef = useRef('')
 
-  const cleanup = useCallback(() => {
+  // Re-entry guard (sync) + cancellation token for in-flight startup.
+  const busyRef = useRef(false)
+  const startTokenRef = useRef(0)
+
+  const clearTimer = () => {
     if (timerRef.current) {
       clearInterval(timerRef.current)
       timerRef.current = null
     }
-    // Stop every track from every captured stream (releases mic + screen-share).
-    streamsRef.current.forEach((stream) => {
-      stream.getTracks().forEach((track) => track.stop())
-    })
+  }
+
+  // Tear down a COMMITTED session: recorder + destination output + input streams
+  // + AudioContext. `deliver=false` detaches handlers so no blob is emitted
+  // (used for cancel/unmount); the normal stop() path delivers via onstop.
+  const releaseResources = useCallback((deliver) => {
+    clearTimer()
+    const recorder = recorderRef.current
+    if (recorder) {
+      if (!deliver) {
+        recorder.ondataavailable = null
+        recorder.onstop = null
+        recorder.onerror = null
+      }
+      if (recorder.state !== 'inactive') {
+        try {
+          recorder.stop()
+        } catch {
+          // ignore
+        }
+      }
+    }
+    // Stop the destination's OWN output track (closing the ctx is not enough).
+    if (destRef.current?.stream) {
+      destRef.current.stream.getTracks().forEach((t) => t.stop())
+    }
+    // Stop every input track (releases mic + screen-share indicator).
+    streamsRef.current.forEach((stream) => stream.getTracks().forEach((t) => t.stop()))
     streamsRef.current = []
     if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
       audioCtxRef.current.close().catch(() => {})
@@ -45,22 +80,36 @@ export function useLiveRecorder({ onBlob } = {}) {
     recorderRef.current = null
   }, [])
 
-  // Release everything if the component unmounts mid-recording.
-  useEffect(() => cleanup, [cleanup])
+  // Abandon the current session/startup without emitting a blob.
+  const cancel = useCallback(() => {
+    startTokenRef.current += 1 // invalidate any in-flight startup
+    releaseResources(false)
+    busyRef.current = false
+    setStatus('idle')
+    setElapsed(0)
+  }, [releaseResources])
+
+  // Release everything if the component unmounts mid-startup/recording.
+  useEffect(() => {
+    return () => {
+      startTokenRef.current += 1
+      releaseResources(false)
+      busyRef.current = false
+    }
+  }, [releaseResources])
 
   const pickMimeType = () => {
     const preferred = 'audio/webm;codecs=opus'
-    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported?.(preferred)) {
-      return preferred
-    }
-    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported?.('audio/webm')) {
-      return 'audio/webm'
-    }
+    const has = (t) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported?.(t)
+    if (has(preferred)) return preferred
+    if (has('audio/webm')) return 'audio/webm'
     return '' // let the browser choose its default
   }
 
   const start = useCallback(
     async ({ useMic, useComputer }) => {
+      // Block re-entry: never begin a second session while one is starting/active.
+      if (busyRef.current) return
       setRecError('')
 
       if (!useMic && !useComputer) {
@@ -72,56 +121,77 @@ export function useLiveRecorder({ onBlob } = {}) {
         return
       }
 
-      const captured = []
-      const sourceStreams = []
+      busyRef.current = true
+      const myToken = ++startTokenRef.current
+      const isStale = () => startTokenRef.current !== myToken
+      setStatus('starting')
+
+      // Streams held locally until the session is fully committed to refs.
+      const captured = [] // every raw stream we opened (for cleanup on failure)
+      const sourceStreams = [] // audio-only streams that feed the mixer
+
+      const abort = (userError) => {
+        captured.forEach((s) => s.getTracks().forEach((t) => t.stop()))
+        if (!isStale()) {
+          if (userError) setRecError(userError)
+          busyRef.current = false
+          setStatus('idle')
+        } else {
+          // Cancelled mid-startup: streams stopped above, stay idle silently.
+          busyRef.current = false
+        }
+      }
 
       try {
-        if (useMic) {
-          const micStream = await navigator.mediaDevices.getUserMedia({ audio: true })
-          captured.push(micStream)
-          sourceStreams.push(micStream)
-        }
-
+        // B3: request display capture FIRST, straight off the click gesture, so a
+        // slow mic prompt cannot consume the transient user activation it needs.
         if (useComputer) {
           if (!navigator.mediaDevices.getDisplayMedia) {
-            throw makeError('unsupported-display', 'Computer audio capture is not supported in this browser (try Chrome or Edge).')
+            return abort('Computer audio capture is not supported in this browser (try Chrome or Edge).')
           }
-          // Video must be requested for the browser to expose tab/system audio.
           const displayStream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true })
           captured.push(displayStream)
+          if (isStale()) return abort()
 
           const audioTracks = displayStream.getAudioTracks()
           if (audioTracks.length === 0) {
-            // User forgot to tick "Share audio" in the picker.
-            displayStream.getTracks().forEach((t) => t.stop())
-            captured.pop()
-            throw makeError(
-              'no-computer-audio',
+            return abort(
               'No computer audio track was shared. Re-try and enable "Share tab audio" / "Share system audio" in the picker.'
             )
           }
-
-          // Keep only the audio; drop the video track we were forced to request.
           const audioOnly = new MediaStream(audioTracks)
           displayStream.getVideoTracks().forEach((t) => t.stop())
           sourceStreams.push(audioOnly)
         }
+
+        if (useMic) {
+          const micStream = await navigator.mediaDevices.getUserMedia({ audio: true })
+          captured.push(micStream)
+          if (isStale()) return abort()
+          sourceStreams.push(micStream)
+        }
       } catch (err) {
-        // Stop anything we already opened before failing.
-        captured.forEach((s) => s.getTracks().forEach((t) => t.stop()))
-        setRecError(describeCaptureError(err))
-        return
+        return abort(describeCaptureError(err))
       }
 
-      // Mix all sources into a single destination stream.
+      // Mix all sources into a single destination stream, then record it.
       let ctx
       try {
         const AudioCtx = window.AudioContext || window.webkitAudioContext
         ctx = new AudioCtx()
         const dest = ctx.createMediaStreamDestination()
-        sourceStreams.forEach((stream) => {
-          ctx.createMediaStreamSource(stream).connect(dest)
-        })
+        sourceStreams.forEach((stream) => ctx.createMediaStreamSource(stream).connect(dest))
+
+        // B4: a context created suspended after the prompts records silence.
+        if (ctx.state === 'suspended') await ctx.resume()
+        if (isStale()) {
+          if (ctx.state !== 'closed') ctx.close().catch(() => {})
+          return abort()
+        }
+        if (ctx.state !== 'running') {
+          if (ctx.state !== 'closed') ctx.close().catch(() => {})
+          return abort('Could not start the audio engine (context not running).')
+        }
 
         const mimeType = pickMimeType()
         mimeRef.current = mimeType
@@ -137,59 +207,89 @@ export function useLiveRecorder({ onBlob } = {}) {
           const type = mimeRef.current || (chunksRef.current[0]?.type ?? 'audio/webm')
           const blob = new Blob(chunksRef.current, { type })
           chunksRef.current = []
-          cleanup()
-          setRecording(false)
+          releaseResources(true)
+          busyRef.current = false
+          setStatus('idle')
           setElapsed(0)
           if (blob.size > 0) onBlob?.(blob, type)
         }
+        recorder.onerror = () => {
+          releaseResources(false)
+          busyRef.current = false
+          setStatus('idle')
+          setElapsed(0)
+          setRecError('Recording failed unexpectedly. Please try again.')
+        }
 
+        // Suggestion: if a source track ends (user stops screen share mid-record),
+        // stop the session instead of timing over silence.
+        sourceStreams.forEach((stream) =>
+          stream.getTracks().forEach((track) => {
+            track.onended = () => {
+              if (recorderRef.current === recorder && recorder.state !== 'inactive') {
+                recorder.stop()
+              }
+            }
+          })
+        )
+
+        // Commit the session to the shared refs.
         audioCtxRef.current = ctx
         destRef.current = dest
         recorderRef.current = recorder
         streamsRef.current = captured
 
         recorder.start()
-        setRecording(true)
+        setStatus('recording')
         setElapsed(0)
         timerRef.current = setInterval(() => setElapsed((s) => s + 1), 1000)
       } catch (err) {
         captured.forEach((s) => s.getTracks().forEach((t) => t.stop()))
         if (ctx && ctx.state !== 'closed') ctx.close().catch(() => {})
-        setRecError('Could not start recording: ' + (err?.message || 'unknown error'))
+        if (!isStale()) {
+          setRecError('Could not start recording: ' + (err?.message || 'unknown error'))
+          busyRef.current = false
+          setStatus('idle')
+        } else {
+          busyRef.current = false
+        }
       }
     },
-    [cleanup, onBlob]
+    [releaseResources, onBlob]
   )
 
   const stop = useCallback(() => {
     const recorder = recorderRef.current
     if (recorder && recorder.state !== 'inactive') {
-      recorder.stop() // fires onstop -> builds blob + cleanup
+      recorder.stop() // fires onstop -> builds blob + releaseResources
     } else {
-      cleanup()
-      setRecording(false)
-      setElapsed(0)
+      // Nothing committed yet (still starting): abandon it.
+      cancel()
     }
-  }, [cleanup])
+  }, [cancel])
 
-  return { recording, elapsed, recError, setRecError, start, stop }
-}
-
-function makeError(code, message) {
-  const err = new Error(message)
-  err.code = code
-  return err
+  return {
+    status,
+    recording: status === 'recording',
+    starting: status === 'starting',
+    elapsed,
+    recError,
+    setRecError,
+    start,
+    stop,
+    cancel
+  }
 }
 
 function describeCaptureError(err) {
-  if (err?.code === 'unsupported-display' || err?.code === 'no-computer-audio') {
-    return err.message
-  }
   if (err?.name === 'NotAllowedError' || err?.name === 'SecurityError') {
     return 'Permission denied. Allow microphone / screen-audio access to record.'
   }
   if (err?.name === 'NotFoundError') {
     return 'No matching audio device was found.'
+  }
+  if (err?.name === 'NotSupportedError') {
+    return 'Computer audio capture is not supported in this browser (try Chrome or Edge).'
   }
   return 'Could not access audio: ' + (err?.message || 'unknown error')
 }
