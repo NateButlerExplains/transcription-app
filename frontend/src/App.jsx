@@ -16,13 +16,33 @@ function App() {
   const [liveEnabled, setLiveEnabled] = useState(false)
   const [useMic, setUseMic] = useState(true)
   const [useComputer, setUseComputer] = useState(false)
+  const [liveText, setLiveText] = useState('')
+  const [streamNote, setStreamNote] = useState('')
+  const [savedNote, setSavedNote] = useState('')
 
   // B5: only the most-recent transcription request may write the display.
   const requestIdRef = useRef(0)
 
+  // Auto-save a recording's final transcript to the user's Downloads folder as
+  // Markdown (recordings only — the file-drop path keeps its manual export).
+  const autoSaveTranscript = useCallback((text, segs) => {
+    if (!text || !text.trim()) return
+    const content = buildTranscriptMd(text, segs)
+    const fname = `transcript-${formatStamp(new Date())}.md`
+    const blob = new Blob([content], { type: 'text/markdown' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = fname
+    a.click()
+    URL.revokeObjectURL(url)
+    setSavedNote(`Auto-saved ${fname} to your Downloads folder.`)
+  }, [])
+
   // Shared transcription: send any File/Blob to the backend and render results.
+  // Returns { text, segments } on success, or null if stale/failed.
   const transcribeFile = useCallback(async (file, displayName) => {
-    if (!file) return
+    if (!file) return null
     const myId = ++requestIdRef.current
     setFileName(displayName)
     setLoading(true)
@@ -35,29 +55,71 @@ function App() {
       const response = await axios.post('http://127.0.0.1:8000/transcribe', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       })
-      if (requestIdRef.current !== myId) return // stale response, ignore
+      if (requestIdRef.current !== myId) return null // stale response, ignore
       setTranscript(response.data.text)
       setSegments(response.data.segments)
+      return { text: response.data.text, segments: response.data.segments }
     } catch {
-      if (requestIdRef.current !== myId) return
-      setError('Transcription failed. Make sure the backend is running.')
+      if (requestIdRef.current === myId) {
+        setError('Transcription failed. Make sure the backend is running.')
+      }
+      return null
     } finally {
       if (requestIdRef.current === myId) setLoading(false)
     }
   }, [])
 
+  // Fallback path: WebSocket streaming unavailable — transcribe the whole blob
+  // once via the one-shot POST, then auto-save.
   const handleRecordedBlob = useCallback(
-    (blob, mimeType) => {
+    async (blob, mimeType) => {
       const type = mimeType || blob.type
       const name = `recording.${extForMime(type)}`
       const file = new File([blob], name, { type })
-      transcribeFile(file, name)
+      const res = await transcribeFile(file, name)
+      if (res && res.text) autoSaveTranscript(res.text, res.segments)
     },
-    [transcribeFile]
+    [transcribeFile, autoSaveTranscript]
   )
 
-  const { recording, starting, stopping, elapsed, recError, setRecError, start, stop, cancel } =
-    useLiveRecorder({ onBlob: handleRecordedBlob })
+  // Streaming: incremental partial transcript while recording.
+  const handlePartial = useCallback((text) => setLiveText(text), [])
+
+  // Streaming: final full transcript after Stop — render + auto-save.
+  const handleFinal = useCallback(
+    (text, segs) => {
+      requestIdRef.current++ // invalidate any pending one-shot response
+      setLiveText('')
+      setLoading(false)
+      setError('')
+      setFileName('Live recording')
+      setTranscript(text)
+      setSegments(segs)
+      autoSaveTranscript(text, segs)
+    },
+    [autoSaveTranscript]
+  )
+
+  const handleStreamNote = useCallback((msg) => setStreamNote(msg), [])
+
+  const { recording, starting, stopping, finalizing, elapsed, recError, setRecError, start, stop, cancel } =
+    useLiveRecorder({
+      onBlob: handleRecordedBlob,
+      onPartial: handlePartial,
+      onFinal: handleFinal,
+      onStreamNote: handleStreamNote,
+      wsUrl: 'ws://127.0.0.1:8000/ws/transcribe'
+    })
+
+  const busy = recording || starting || stopping || finalizing
+
+  const handleRecord = () => {
+    setLiveText('')
+    setStreamNote('')
+    setSavedNote('')
+    setError('')
+    start({ useMic, useComputer })
+  }
 
   const onDrop = useCallback(
     async (acceptedFiles) => {
@@ -75,9 +137,10 @@ function App() {
   }
 
   const toggleLive = () => {
-    // Disabling mid-startup or mid-recording must abandon the in-flight session.
-    if (liveEnabled && (recording || starting || stopping)) cancel()
+    // Disabling mid-startup/recording/finalizing must abandon the session.
+    if (liveEnabled && busy) cancel()
     setRecError('')
+    setLiveText('')
     setLiveEnabled((v) => !v)
   }
 
@@ -158,7 +221,7 @@ function App() {
                   <input
                     type="checkbox"
                     checked={useMic}
-                    disabled={recording}
+                    disabled={busy}
                     onChange={(e) => setUseMic(e.target.checked)}
                   />
                   <span>🎙 Microphone</span>
@@ -167,7 +230,7 @@ function App() {
                   <input
                     type="checkbox"
                     checked={useComputer}
-                    disabled={recording}
+                    disabled={busy}
                     onChange={(e) => setUseComputer(e.target.checked)}
                   />
                   <span>💻 Computer audio</span>
@@ -175,21 +238,21 @@ function App() {
               </div>
 
               <div className="live-controls">
-                {recording || stopping ? (
+                {recording || stopping || finalizing ? (
                   <button
                     type="button"
                     className="btn btn-stop"
-                    disabled={stopping}
+                    disabled={stopping || finalizing}
                     onClick={stop}
                   >
-                    {stopping ? 'Stopping…' : '■ Stop'}
+                    {finalizing ? 'Finalizing…' : stopping ? 'Stopping…' : '■ Stop'}
                   </button>
                 ) : (
                   <button
                     type="button"
                     className="btn btn-primary"
                     disabled={loading || starting || (!useMic && !useComputer)}
-                    onClick={() => start({ useMic, useComputer })}
+                    onClick={handleRecord}
                   >
                     {starting ? 'Starting…' : '● Record'}
                   </button>
@@ -201,9 +264,31 @@ function App() {
                 )}
               </div>
 
+              {(recording || finalizing) && (
+                <div className="live-transcript">
+                  <div className="live-transcript-head">
+                    <span className="live-badge">
+                      <span className="rec-blink" /> LIVE
+                    </span>
+                    <span>{finalizing ? 'Finalizing full transcript…' : 'Transcribing as you speak'}</span>
+                  </div>
+                  <div className="live-transcript-body">
+                    {liveText ? (
+                      liveText
+                    ) : (
+                      <span className="live-placeholder">
+                        Listening… partial text appears every few seconds.
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {streamNote && <div className="live-note">{streamNote}</div>}
               {recError && <div className="error-banner live-error">{recError}</div>}
               <p className="live-hint">
                 For computer audio, tick “Share tab audio” / “Share system audio” in the browser picker.
+                On Stop, the final transcript auto-saves to your Downloads folder.
               </p>
             </div>
           )}
@@ -234,6 +319,7 @@ function App() {
         </div>
 
         {error && <div className="error-banner">{error}</div>}
+        {savedNote && <div className="saved-note">✓ {savedNote}</div>}
 
         {transcript && (
           <div className="results">
@@ -265,6 +351,30 @@ function App() {
         <p>Running locally · Whisper base model · Private by default</p>
       </footer>
     </div>
+  )
+}
+
+// Build the same timestamped Markdown used by the manual export.
+function segTime(seconds) {
+  const h = Math.floor(seconds / 3600).toString().padStart(2, '0')
+  const m = Math.floor((seconds % 3600) / 60).toString().padStart(2, '0')
+  const s = Math.floor(seconds % 60).toString().padStart(2, '0')
+  return `${h}:${m}:${s}`
+}
+
+function buildTranscriptMd(text, segments) {
+  if (segments && segments.length) {
+    return segments.map((seg) => `**[${segTime(seg.start)}]** ${seg.text.trim()}`).join('\n\n')
+  }
+  return text
+}
+
+// YYYYMMDD-HHMMSS for auto-save filenames.
+function formatStamp(d) {
+  const p = (n) => n.toString().padStart(2, '0')
+  return (
+    `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+    `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
   )
 }
 

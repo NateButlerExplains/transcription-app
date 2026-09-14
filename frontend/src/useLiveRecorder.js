@@ -3,7 +3,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 /**
  * Live audio recorder that mixes microphone and/or computer (system/tab) audio
  * into a single MediaStream via the Web Audio API, records it with MediaRecorder,
- * and hands the resulting Blob back to the caller on stop.
+ * streams the growing recording to the backend over a WebSocket for near-live
+ * transcription, and hands the final transcript (or a fallback Blob) to the
+ * caller on stop.
  *
  * Sources:
  *  - Microphone: navigator.mediaDevices.getUserMedia({ audio: true })
@@ -14,24 +16,32 @@ import { useCallback, useEffect, useRef, useState } from 'react'
  * Mixing: AudioContext + one MediaStreamAudioSourceNode per source, all wired
  * into a single MediaStreamAudioDestinationNode whose stream is recorded.
  *
- * Lifecycle guarantees:
- *  - Startup runs through a 'starting' status behind a sync busy guard, so a
- *    second session can never begin while one is starting/active/stopping.
- *  - Every acquired resource (input stream, AudioContext, destination) is
- *    registered for cancellation the moment it exists — a cancel()/unmount mid
- *    startup stops it immediately (no stuck mic light / screen-share banner).
- *  - A monotonic start token owns the guard/status/committed refs: only the
- *    CURRENT token may release the busy guard or mutate shared state, so a
- *    stale startup completion stops only the streams it locally acquired and
- *    touches nothing shared.
- *  - stop() is idempotent: a committed recorder is allowed to finish delivering
- *    its blob; a second Stop is a no-op, never a discard.
+ * Streaming: MediaRecorder runs with a 1s timeslice; each webm chunk is sent
+ * over the WebSocket as produced. The server emits {type:'partial'} updates
+ * (onPartial) while recording and a {type:'final'} full transcript (onFinal)
+ * after 'stop'. If the socket never opens or errors, we fall back to the
+ * one-shot POST path via onBlob and report it through onStreamNote.
+ *
+ * Lifecycle guarantees (preserved across review rounds):
+ *  - 'starting' status behind a sync busy guard; no overlapping sessions.
+ *  - Every acquired resource is owned for cancellation the moment it exists.
+ *  - A monotonic start token owns the guard/status/committed refs; a stale
+ *    startup completion touches nothing shared.
+ *  - stop() is idempotent; a committed recorder finishes delivering.
+ *  - cancel()/unmount stops all tracks, closes the AudioContext, and closes the
+ *    WebSocket without delivering a blob.
  */
-export function useLiveRecorder({ onBlob } = {}) {
-  // 'idle' | 'starting' | 'recording' | 'stopping'
+export function useLiveRecorder({ onBlob, onPartial, onFinal, onStreamNote, wsUrl } = {}) {
+  // 'idle' | 'starting' | 'recording' | 'stopping' | 'finalizing'
   const [status, setStatus] = useState('idle')
   const [elapsed, setElapsed] = useState(0)
   const [recError, setRecError] = useState('')
+
+  // Latest callbacks kept in a ref so handler identities never churn deps.
+  const cbRef = useRef({ onBlob, onPartial, onFinal, onStreamNote })
+  useEffect(() => {
+    cbRef.current = { onBlob, onPartial, onFinal, onStreamNote }
+  }, [onBlob, onPartial, onFinal, onStreamNote])
 
   // Committed session refs (written only once a session is fully started).
   const audioCtxRef = useRef(null)
@@ -49,6 +59,14 @@ export function useLiveRecorder({ onBlob } = {}) {
   const busyRef = useRef(false)
   const startTokenRef = useRef(0)
 
+  // Streaming state.
+  const wsRef = useRef(null)
+  const sendQueueRef = useRef([]) // chunks awaiting an OPEN socket
+  const streamOkRef = useRef(false) // socket reached OPEN and hasn't errored
+  const finalizedRef = useRef(false) // final delivered (or fallback done)
+  const finalizingRef = useRef(false) // stop sent, awaiting final
+  const pendingBlobRef = useRef(null) // { blob, type } for fallback delivery
+
   const clearTimer = () => {
     if (timerRef.current) {
       clearInterval(timerRef.current)
@@ -56,9 +74,34 @@ export function useLiveRecorder({ onBlob } = {}) {
     }
   }
 
+  const closeWs = useCallback(() => {
+    const ws = wsRef.current
+    if (ws) {
+      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null
+      try {
+        if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) ws.close()
+      } catch {
+        // ignore
+      }
+    }
+    wsRef.current = null
+    sendQueueRef.current = []
+  }, [])
+
+  const flushQueue = useCallback(() => {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    const q = sendQueueRef.current
+    while (q.length) {
+      try {
+        ws.send(q.shift())
+      } catch {
+        break
+      }
+    }
+  }, [])
+
   // Stop a bundle of resources: destination output tracks, input tracks, ctx.
-  // Stopping the destination stream's OWN tracks is required — closing the
-  // AudioContext is not a substitute.
   const stopBundle = (streams, ctx, dest) => {
     if (dest?.stream) dest.stream.getTracks().forEach((t) => t.stop())
     streams.forEach((stream) => stream.getTracks().forEach((t) => t.stop()))
@@ -66,8 +109,6 @@ export function useLiveRecorder({ onBlob } = {}) {
   }
 
   // Tear down BOTH the committed session and any in-flight startup resources.
-  // `deliver=false` detaches recorder handlers so no blob is emitted
-  // (cancel/unmount); the normal stop() path passes true so onstop delivers.
   const releaseResources = useCallback((deliver) => {
     clearTimer()
     const recorder = recorderRef.current
@@ -98,23 +139,67 @@ export function useLiveRecorder({ onBlob } = {}) {
     }
   }, [])
 
-  // Abandon the current session/startup without emitting a blob.
+  // Fallback: stream ended before a final arrived — transcribe the local blob.
+  const finalizeFallback = useCallback(() => {
+    if (finalizedRef.current) return
+    finalizedRef.current = true
+    finalizingRef.current = false
+    const pb = pendingBlobRef.current
+    pendingBlobRef.current = null
+    closeWs()
+    busyRef.current = false
+    setStatus('idle')
+    cbRef.current.onStreamNote?.('Live stream ended early — transcribing the full recording.')
+    if (pb && pb.blob.size > 0) cbRef.current.onBlob?.(pb.blob, pb.type)
+  }, [closeWs])
+
+  const handleWsMessage = useCallback(
+    (ev) => {
+      if (finalizedRef.current) return
+      let msg
+      try {
+        msg = JSON.parse(ev.data)
+      } catch {
+        return
+      }
+      if (msg.type === 'partial') {
+        cbRef.current.onPartial?.(msg.text || '', msg.segments || [])
+      } else if (msg.type === 'final') {
+        finalizedRef.current = true
+        finalizingRef.current = false
+        closeWs()
+        busyRef.current = false
+        setStatus('idle')
+        setElapsed(0)
+        cbRef.current.onFinal?.(msg.text || '', msg.segments || [])
+      }
+    },
+    [closeWs]
+  )
+
+  // Abandon the current session/startup without emitting a blob or a final.
   const cancel = useCallback(() => {
     startTokenRef.current += 1 // invalidate any in-flight startup
+    finalizedRef.current = true // ignore any late ws final
+    finalizingRef.current = false
+    pendingBlobRef.current = null
+    closeWs()
     releaseResources(false)
     busyRef.current = false
     setStatus('idle')
     setElapsed(0)
-  }, [releaseResources])
+  }, [closeWs, releaseResources])
 
   // Release everything if the component unmounts mid-startup/recording.
   useEffect(() => {
     return () => {
       startTokenRef.current += 1
+      finalizedRef.current = true
+      closeWs()
       releaseResources(false)
       busyRef.current = false
     }
-  }, [releaseResources])
+  }, [closeWs, releaseResources])
 
   const pickMimeType = () => {
     const preferred = 'audio/webm;codecs=opus'
@@ -126,8 +211,6 @@ export function useLiveRecorder({ onBlob } = {}) {
 
   const start = useCallback(
     async ({ useMic, useComputer }) => {
-      // Block re-entry: never begin a second session while one is
-      // starting / active / stopping.
       if (busyRef.current) return
       setRecError('')
 
@@ -145,14 +228,10 @@ export function useLiveRecorder({ onBlob } = {}) {
       const isCurrent = () => startTokenRef.current === myToken
       setStatus('starting')
 
-      // Own in-flight resources from the moment they exist so cancel()/unmount
-      // can release them even mid-await.
       const inflight = { streams: [], ctx: null, dest: null }
       inflightRef.current = inflight
-      const sourceStreams = [] // audio-only streams feeding the mixer
+      const sourceStreams = []
 
-      // Stop only what THIS startup locally acquired; touch shared state only
-      // when still the current token.
       const abort = (userError) => {
         stopBundle(inflight.streams, inflight.ctx, inflight.dest)
         if (inflightRef.current === inflight) inflightRef.current = null
@@ -164,8 +243,7 @@ export function useLiveRecorder({ onBlob } = {}) {
       }
 
       try {
-        // B3: request display capture FIRST, straight off the click gesture, so a
-        // slow mic prompt cannot consume the transient user activation it needs.
+        // B3: request display capture FIRST, off the click gesture.
         if (useComputer) {
           if (!navigator.mediaDevices.getDisplayMedia) {
             return abort('Computer audio capture is not supported in this browser (try Chrome or Edge).')
@@ -195,16 +273,15 @@ export function useLiveRecorder({ onBlob } = {}) {
         return abort(describeCaptureError(err))
       }
 
-      // Mix all sources into a single destination stream, then record it.
       try {
         const AudioCtx = window.AudioContext || window.webkitAudioContext
         const ctx = new AudioCtx()
-        inflight.ctx = ctx // owned for cancellation before we await resume()
+        inflight.ctx = ctx
         const dest = ctx.createMediaStreamDestination()
         inflight.dest = dest
         sourceStreams.forEach((stream) => ctx.createMediaStreamSource(stream).connect(dest))
 
-        // B4: a context created suspended after the prompts records silence.
+        // B4: resume a context that came up suspended (else it records silence).
         if (ctx.state === 'suspended') await ctx.resume()
         if (!isCurrent()) return abort()
         if (ctx.state !== 'running') {
@@ -217,23 +294,82 @@ export function useLiveRecorder({ onBlob } = {}) {
           ? new MediaRecorder(dest.stream, { mimeType })
           : new MediaRecorder(dest.stream)
 
+        // Reset streaming state for this session.
+        finalizedRef.current = false
+        finalizingRef.current = false
+        streamOkRef.current = false
+        sendQueueRef.current = []
+        pendingBlobRef.current = null
         chunksRef.current = []
+
+        // Open the streaming socket (best effort — one-shot fallback otherwise).
+        if (wsUrl && typeof WebSocket !== 'undefined') {
+          try {
+            const ws = new WebSocket(wsUrl)
+            wsRef.current = ws
+            ws.onopen = () => {
+              streamOkRef.current = true
+              flushQueue()
+            }
+            ws.onmessage = handleWsMessage
+            ws.onerror = () => {
+              if (!streamOkRef.current) {
+                cbRef.current.onStreamNote?.(
+                  'Live transcription unavailable — the full transcript will appear after you stop.'
+                )
+              }
+              streamOkRef.current = false
+            }
+            ws.onclose = () => {
+              // If we've asked for the final and never got it, fall back.
+              if (finalizingRef.current) finalizeFallback()
+            }
+          } catch {
+            wsRef.current = null
+          }
+        }
+
         recorder.ondataavailable = (e) => {
-          if (e.data && e.data.size > 0) chunksRef.current.push(e.data)
+          if (e.data && e.data.size > 0) {
+            chunksRef.current.push(e.data)
+            if (wsRef.current) {
+              sendQueueRef.current.push(e.data)
+              flushQueue()
+            }
+          }
         }
         recorder.onstop = () => {
           if (!isCurrent()) return
           const type = mimeRef.current || (chunksRef.current[0]?.type ?? 'audio/webm')
           const blob = new Blob(chunksRef.current, { type })
           chunksRef.current = []
-          releaseResources(true)
-          busyRef.current = false
-          setStatus('idle')
+          releaseResources(true) // stops tracks/ctx; does NOT touch the socket
           setElapsed(0)
-          if (blob.size > 0) onBlob?.(blob, type)
+
+          const ws = wsRef.current
+          if (ws && streamOkRef.current && ws.readyState === WebSocket.OPEN) {
+            // Stream the tail, ask for the final, keep the socket open for it.
+            pendingBlobRef.current = { blob, type }
+            finalizingRef.current = true
+            setStatus('finalizing')
+            flushQueue()
+            try {
+              ws.send('stop')
+            } catch {
+              finalizeFallback()
+            }
+          } else {
+            // No healthy stream — one-shot fallback.
+            busyRef.current = false
+            setStatus('idle')
+            closeWs()
+            if (blob.size > 0) cbRef.current.onBlob?.(blob, type)
+          }
         }
         recorder.onerror = () => {
           if (!isCurrent()) return
+          finalizedRef.current = true
+          closeWs()
           releaseResources(false)
           busyRef.current = false
           setStatus('idle')
@@ -241,8 +377,7 @@ export function useLiveRecorder({ onBlob } = {}) {
           setRecError('Recording failed unexpectedly. Please try again.')
         }
 
-        // If a source track ends (user stops screen share mid-record), stop the
-        // session instead of timing over silence.
+        // Auto-stop if a source track ends (user stops screen share mid-record).
         sourceStreams.forEach((stream) =>
           stream.getTracks().forEach((track) => {
             track.onended = () => {
@@ -254,48 +389,43 @@ export function useLiveRecorder({ onBlob } = {}) {
           })
         )
 
-        // Commit the session: ownership moves from inflight to the committed refs.
+        // Commit the session: ownership moves to the committed refs.
         audioCtxRef.current = ctx
         destRef.current = dest
         recorderRef.current = recorder
         streamsRef.current = inflight.streams
         inflightRef.current = null
 
-        recorder.start()
+        recorder.start(1000) // 1s timeslice -> periodic chunks for streaming
         setStatus('recording')
         setElapsed(0)
         timerRef.current = setInterval(() => setElapsed((s) => s + 1), 1000)
       } catch (err) {
         if (isCurrent()) {
-          // May have already committed to the shared refs (e.g. recorder.start()
-          // threw). Fully tear down committed refs + detach handlers so no stale
-          // recorder survives to break the next session's stop().
+          finalizedRef.current = true
+          closeWs()
           releaseResources(false)
           setRecError('Could not start recording: ' + (err?.message || 'unknown error'))
           busyRef.current = false
           setStatus('idle')
         } else {
-          // Stale token: touch nothing shared — clean up only what we acquired.
           stopBundle(inflight.streams, inflight.ctx, inflight.dest)
           if (inflightRef.current === inflight) inflightRef.current = null
         }
       }
     },
-    [releaseResources, onBlob]
+    [releaseResources, closeWs, flushQueue, handleWsMessage, finalizeFallback, wsUrl]
   )
 
   const stop = useCallback(() => {
     const recorder = recorderRef.current
     if (recorder) {
-      // Committed session. Let it finish delivering; a second Stop is a no-op.
       if (recorder.state === 'recording' || recorder.state === 'paused') {
         setStatus('stopping')
-        recorder.stop() // onstop builds the blob + releaseResources
+        recorder.stop() // onstop finalizes; a second Stop is a no-op
       }
       return
     }
-    // No committed recorder: only a 'starting' session (nothing to deliver) or
-    // nothing at all. Abandon a starting session.
     if (busyRef.current) cancel()
   }, [cancel])
 
@@ -304,6 +434,7 @@ export function useLiveRecorder({ onBlob } = {}) {
     recording: status === 'recording',
     starting: status === 'starting',
     stopping: status === 'stopping',
+    finalizing: status === 'finalizing',
     elapsed,
     recError,
     setRecError,
