@@ -266,13 +266,18 @@ export function useLiveRecorder({ onBlob } = {}) {
         setElapsed(0)
         timerRef.current = setInterval(() => setElapsed((s) => s + 1), 1000)
       } catch (err) {
-        // Nothing committed yet — tear down the in-flight bundle only.
-        stopBundle(inflight.streams, inflight.ctx, inflight.dest)
-        if (inflightRef.current === inflight) inflightRef.current = null
         if (isCurrent()) {
+          // May have already committed to the shared refs (e.g. recorder.start()
+          // threw). Fully tear down committed refs + detach handlers so no stale
+          // recorder survives to break the next session's stop().
+          releaseResources(false)
           setRecError('Could not start recording: ' + (err?.message || 'unknown error'))
           busyRef.current = false
           setStatus('idle')
+        } else {
+          // Stale token: touch nothing shared — clean up only what we acquired.
+          stopBundle(inflight.streams, inflight.ctx, inflight.dest)
+          if (inflightRef.current === inflight) inflightRef.current = null
         }
       }
     },
